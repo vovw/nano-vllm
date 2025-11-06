@@ -1,6 +1,10 @@
 from copy import copy
+from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
+from typing import Iterable
+
+import torch
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -11,11 +15,28 @@ class SequenceStatus(Enum):
     FINISHED = auto()
 
 
+@dataclass
+class VisionInput:
+    """Container for per-image metadata associated with a sequence."""
+
+    pixel_values: torch.Tensor
+    grid_thw: tuple[int, int, int]
+    token_span: tuple[int, int]
+
+    def num_tokens(self) -> int:
+        return self.token_span[1] - self.token_span[0]
+
+
 class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams = SamplingParams(),
+        vision_inputs: Iterable[VisionInput] | None = None,
+    ):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -23,10 +44,11 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
-        self.block_table = []
+        self.block_table: list[int] = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.vision_inputs = list(vision_inputs) if vision_inputs is not None else []
 
     def __len__(self):
         return self.num_tokens
@@ -72,12 +94,38 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        vision_state = [
+            (
+                vision.pixel_values,
+                vision.grid_thw,
+                vision.token_span,
+            )
+            for vision in self.vision_inputs
+        ]
+        payload = (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            vision_state,
+            self.token_ids,
+            self.last_token,
+        )
+        return payload
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_token = state[-1]
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+            vision_state,
+            token_ids,
+            last_token,
+        ) = state
+        self.vision_inputs = [
+            VisionInput(pixel_values=pixel_values, grid_thw=grid_thw, token_span=token_span)
+            for pixel_values, grid_thw, token_span in vision_state
+        ]
+        self.token_ids = token_ids
+        self.last_token = last_token

@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.prompts import Prompt
 
 
 class LLMEngine:
@@ -28,7 +29,10 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        tokenizer_kwargs = {"use_fast": True}
+        if config.trust_remote_code is not None:
+            tokenizer_kwargs["trust_remote_code"] = config.trust_remote_code
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, **tokenizer_kwargs)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
@@ -39,16 +43,30 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+    def add_request(self, prompt: str | list[int] | Prompt, sampling_params: SamplingParams):
+        vision_inputs = None
+        if isinstance(prompt, Prompt):
+            token_ids = list(prompt.token_ids)
+            vision_inputs = list(prompt.vision_inputs)
+        elif isinstance(prompt, dict) and "token_ids" in prompt:
+            token_ids = list(prompt["token_ids"])
+            vision_inputs = list(prompt.get("vision_inputs", []))
+        elif isinstance(prompt, str):
+            token_ids = self.tokenizer.encode(prompt)
+        else:
+            token_ids = list(prompt)
+        if vision_inputs and not self.model_runner.config.is_vlm:
+            raise ValueError("Vision inputs provided but the loaded model does not support multimodal prompts.")
+        seq = Sequence(token_ids, sampling_params, vision_inputs=vision_inputs)
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
+        finished_seq_ids = [seq.seq_id for seq in seqs if seq.is_finished]
+        if finished_seq_ids:
+            self.model_runner.call("release_sequences", finished_seq_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
@@ -58,7 +76,7 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
+        prompts: list[str] | list[list[int]] | list[Prompt],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
